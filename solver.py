@@ -10,7 +10,7 @@ No compiler, binary file, external package, subprocess, network, or stored
 factors are required. Other platforms use the portable Python implementation.
 
 Parameters depend on the input's size and quadratic residues, not a corpus.
-Native trial division handles 128-bit polynomial values; larger values use
+Native trial division handles 256-bit polynomial values; larger values use
 Python integers. There is no fixed runtime guarantee for arbitrary inputs.
 The input is assumed semiprime; factors are verified and returned in order.
 """
@@ -273,6 +273,62 @@ def _trial_kernel():
     c.emit('4c 89 37 4c 89 7f 08 48 89 d8 48 2b 04 24 48 c1 e8 03 48 83 c4 08')
     c.emit('41 5f 41 5e 41 5d 41 5c 5d 5b c3')
     return c.function(6)
+
+
+def _wide_trial_kernel():
+    # strip(value[4], odd_primes, count, output[][2]) -> output pair count.
+    # Four little-endian limbs hold a positive odd value. Unsigned long
+    # division tests each prime and removes its full power, then stops as
+    # soon as the remainder fits in 128 bits. The existing inverse-based
+    # kernel can finish it, scanning the same base: every emitted prime is
+    # already exhausted, so the two outputs cannot contain duplicate primes.
+    # Output indices are zero-based in odd_primes, just like _trial_kernel.
+    # At most 256 output pairs are needed for a positive 256-bit value.
+    c = _Code()
+    # Preserve callee-saved registers, output origin, and prime count.
+    c.emit('53 55 41 54 41 55 41 56 41 57 51 52')
+    c.emit('4c 8b 27 4c 8b 6f 08 4c 8b 77 10 4c 8b 7f 18')
+    c.emit('48 89 cb 45 31 c0')  # rbx=output, r8=prime index
+    c.emit('4c 89 f0 4c 09 f8')  # upper two limbs already zero?
+    c.jump('0f 84', 'done')
+    c.emit('4c 3b 04 24')
+    c.jump('0f 83', 'done')
+    c.label('prime')
+    c.emit('42 8b 0c 86 31 ed')  # ecx=prime, ebp=exponent
+    c.label('divide')
+    # Divide from the most significant limb down. Each remainder is < p,
+    # so every following 128-by-64 division has a quotient fitting 64 bits.
+    # Skip zero leading quotients, especially just above the 128-bit boundary.
+    c.emit('31 d2 45 31 c9 45 31 d2 4d 85 ff')
+    c.jump('0f 85', 'top')
+    c.emit('49 39 ce')  # third limb >= prime?
+    c.jump('0f 83', 'third')
+    c.emit('4c 89 f2')  # third limb itself is the initial remainder
+    c.jump('e9', 'lower')
+    c.label('top')
+    c.emit('4c 89 f8 48 f7 f1 49 89 c1')
+    c.label('third')
+    c.emit('4c 89 f0 48 f7 f1 49 89 c2')
+    c.label('lower')
+    c.emit('4c 89 e8 48 f7 f1 49 89 c3')
+    c.emit('4c 89 e0 48 f7 f1 48 85 d2')
+    c.jump('0f 85', 'divided')
+    c.emit('49 89 c4 4d 89 dd 4d 89 d6 4d 89 cf ff c5')
+    c.jump('e9', 'divide')
+    c.label('divided')
+    c.emit('85 ed')
+    c.jump('0f 84', 'advance')
+    c.emit('44 89 03 89 6b 04 48 83 c3 08')
+    c.label('advance')
+    c.emit('49 ff c0 4c 89 f0 4c 09 f8')
+    c.jump('0f 84', 'done')
+    c.emit('4c 3b 04 24')
+    c.jump('0f 82', 'prime')
+    c.label('done')
+    c.emit('4c 89 27 4c 89 6f 08 4c 89 77 10 4c 89 7f 18')
+    c.emit('48 89 d8 48 2b 44 24 08 48 c1 e8 03 48 83 c4 10')
+    c.emit('41 5f 41 5e 41 5d 41 5c 5d 5b c3')
+    return c.function(4)
 
 
 
@@ -556,7 +612,9 @@ def _qs_native(n, rng, check, progress=None):
     native_gather = _gather_kernel()
     native_decompose = _trial_kernel()
     small_values = (ctypes.c_uint64*2)()
-    small_output = (ctypes.c_uint32*256)()
+    small_output = (ctypes.c_uint32*512)()
+    # Initialize the wider path only when an actual candidate needs it.
+    native_wide = None
     prime_indices = (ctypes.c_uint32 * (bound+1))()
     for i,p in enumerate(fb): prime_indices[p]=i
     inverse_parameters = array.array('Q')
@@ -814,6 +872,31 @@ def _qs_native(n, rng, check, progress=None):
                     small_values[0], small_values[1] = odd & 0xffffffffffffffff, odd >> 64
                     nh = native_decompose(small_values, inverse_address,
                                           size-1, small_output, prime_indices, bound)
+                    remainder = small_values[0] + (small_values[1] << 64)
+                    last_index = prime_indices[remainder] if 1 < remainder <= bound else 0
+                    if last_index:
+                        remainder = 1
+                elif value.bit_length() <= 256:
+                    native_value = True
+                    e = (value & -value).bit_length()-1
+                    odd = value >> e
+                    if native_wide is None:
+                        native_wide = _wide_trial_kernel()
+                        wide_values = (ctypes.c_uint64*4)()
+                        wide_primes = array.array('I', fb[1:])
+                        wide_address = wide_primes.buffer_info()[0]
+                        output_address = ctypes.addressof(small_output)
+                    for limb in range(4):
+                        wide_values[limb] = (odd >> (64*limb)) & 0xffffffffffffffff
+                    nh = native_wide(wide_values, wide_address, size-1, small_output)
+                    # If all base primes have been tried and the value
+                    # is still wide, it exceeds the allowed cofactor.
+                    if wide_values[2] or wide_values[3]:
+                        continue
+                    small_values[0], small_values[1] = wide_values[0], wide_values[1]
+                    nh += native_decompose(small_values, inverse_address,
+                                           size-1, output_address + nh*8,
+                                           prime_indices, bound)
                     remainder = small_values[0] + (small_values[1] << 64)
                     last_index = prime_indices[remainder] if 1 < remainder <= bound else 0
                     if last_index:
